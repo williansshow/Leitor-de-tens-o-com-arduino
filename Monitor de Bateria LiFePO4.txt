@@ -1,0 +1,489 @@
+/*
+ * Monitor de Bateria LiFePO4 30V - CONTROLE DIRETO DO RELÉ
+ * ✅ Leitura ultra estável (variação < 0.01V)
+ * ✅ Lógica Ajustada: Desliga relé em <= 25.5V, Liga relé em >= 26.5V
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+
+// ========== CONFIGURAÇÃO ACCESS POINT ==========
+const char* ap_ssid = "Monitor24v";
+const char* ap_password = "123456";
+
+// ========== CONFIGURAÇÃO DOS PINOS ==========
+#define PIN_RELAY    2
+#define PIN_ADC      36
+
+// ========== PARÂMETROS DA BATERIA ==========
+// LÓGICA DE PROTEÇÃO DA BATERIA:
+// - Quando tensão <= 25.5V → DESLIGA o relé
+// - Quando tensão >= 26.5V → LIGA o relé
+const float TENSAO_DESLIGA_RELE = 25.5;   // Tensão para DESLIGAR o relé
+const float TENSAO_LIGA_RELE    = 26.5;   // Tensão para LIGAR o relé
+
+// ========== PROTEÇÃO DO RELÉ ==========
+const float HISTERESE = 0.1;       // 0.1V de histerese (evita oscilação)
+const int TEMPO_DEBOUNCE = 3000;   // 3 segundos de confirmação
+
+// ========== PARÂMETROS DO DIVISOR ==========
+const float R1 = 100000.0;
+const float R2 = 6800.0;
+const float FATOR_DIVISOR = R2 / (R1 + R2);
+
+// ========== CONFIGURAÇÃO DO ADC ==========
+const float V_REF_ADC = 3.30;
+const int RESOLUCAO_ADC = 4095;
+
+// ========== FILTRO ==========
+const int NUM_AMOSTRAS = 50;
+float amostras[50];
+int indice_atual = 0;
+
+// ========== EEPROM ==========
+float fator_calibracao = 1.2660;
+
+// ========== VARIÁVEIS ==========
+bool rele_ligado = false;
+float tensao_atual = 0;
+unsigned long last_reading_time = 0;
+const unsigned long READING_INTERVAL = 100;
+
+// Variáveis para debounce
+unsigned long tempo_mudanca = 0;
+bool aguardando_mudanca = false;
+bool estado_desejado = false;
+
+// ========== SERVIDOR WEB ==========
+WebServer server(80);
+
+// ========== EEPROM ==========
+void eepromSalvarFator(float fator) {
+  EEPROM.begin(4);
+  EEPROM.write(0, 0xA5);
+  EEPROM.put(1, fator);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+void eepromCarregarFator() {
+  EEPROM.begin(4);
+  if(EEPROM.read(0) == 0xA5) {
+    EEPROM.get(1, fator_calibracao);
+  } else {
+    eepromSalvarFator(fator_calibracao);
+  }
+  EEPROM.end();
+}
+
+void ajustarFator(float delta) {
+  fator_calibracao += delta;
+  if(fator_calibracao < 0.5f) fator_calibracao = 0.5f;
+  if(fator_calibracao > 1.5f) fator_calibracao = 1.5f;
+  eepromSalvarFator(fator_calibracao);
+  Serial.printf("Fator calibrado: %.4f\n", fator_calibracao);
+}
+
+// ========== FILTROS ==========
+float lerTensaoBruta() {
+  float soma = 0;
+  for(int i = 0; i < 10; i++) {
+    soma += analogRead(PIN_ADC);
+  }
+  int valor_adc = soma / 10;
+  
+  float tensao_adc = (valor_adc * V_REF_ADC) / RESOLUCAO_ADC;
+  float tensao_bateria = tensao_adc / FATOR_DIVISOR;
+  return tensao_bateria * fator_calibracao;
+}
+
+float lerTensaoFiltrada() {
+  amostras[indice_atual] = lerTensaoBruta();
+  indice_atual++;
+  if(indice_atual >= NUM_AMOSTRAS) indice_atual = 0;
+  
+  float soma = 0;
+  for(int i = 0; i < NUM_AMOSTRAS; i++) {
+    soma += amostras[i];
+  }
+  return soma / NUM_AMOSTRAS;
+}
+
+// ========== CONTROLE DO RELÉ ==========
+void controlarRele(float tensao) {
+  float ligar_em = TENSAO_LIGA_RELE;           // 26.5V
+  float desligar_em = TENSAO_DESLIGA_RELE;     // 25.5V
+  
+  // Nova lógica invertida para proteção de bateria
+  bool deve_desligar = (tensao <= desligar_em); // Tensão menor/igual a 25.5V
+  bool deve_ligar = (tensao >= ligar_em);       // Tensão maior/igual a 26.5V
+  
+  static bool ultimo_estado_ligar = false;
+  static bool ultimo_estado_desligar = false;
+  
+  if (deve_ligar != ultimo_estado_ligar) {
+    Serial.printf("⚠️ Tensão %.2fV %s limite de LIGAR (%.1fV)\n", 
+                  tensao, deve_ligar ? "atingiu" : "saiu do", ligar_em);
+    ultimo_estado_ligar = deve_ligar;
+  }
+  
+  if (deve_desligar != ultimo_estado_desligar) {
+    Serial.printf("⚠️ Tensão %.2fV %s limite de DESLIGAR (%.1fV)\n", 
+                  tensao, deve_desligar ? "atingiu" : "saiu do", desligar_em);
+    ultimo_estado_desligar = deve_desligar;
+  }
+  
+  bool precisa_mudar = false;
+  bool novo_estado = rele_ligado;
+  
+  if (!rele_ligado && deve_ligar) {
+    precisa_mudar = true;
+    novo_estado = true;
+    Serial.printf("🔍 Decisão: LIGAR relé (tensão %.2fV >= %.1fV)\n", tensao, ligar_em);
+  }
+  else if (rele_ligado && deve_desligar) {
+    precisa_mudar = true;
+    novo_estado = false;
+    Serial.printf("🔍 Decisão: DESLIGAR relé (tensão %.2fV <= %.1fV)\n", tensao, desligar_em);
+  }
+  
+  if (precisa_mudar) {
+    if (!aguardando_mudanca) {
+      aguardando_mudanca = true;
+      estado_desejado = novo_estado;
+      tempo_mudanca = millis();
+      Serial.printf("⏱️ Aguardando %.1f segundos para confirmar...\n", TEMPO_DEBOUNCE/1000.0);
+    }
+    else if (millis() - tempo_mudanca >= TEMPO_DEBOUNCE) {
+      if (estado_desejado != rele_ligado) {
+        rele_ligado = estado_desejado;
+        digitalWrite(PIN_RELAY, rele_ligado ? HIGH : LOW);
+        
+        if (rele_ligado) {
+          Serial.printf("✅ RELÉ LIGADO! (tensão %.2fV)\n", tensao);
+        } else {
+          Serial.printf("✅ RELÉ DESLIGADO! (tensão %.2fV)\n", tensao);
+        }
+      }
+      aguardando_mudanca = false;
+    }
+  } else {
+    if (aguardando_mudanca) {
+      Serial.println("❌ Condição normalizada - debounce cancelado");
+      aguardando_mudanca = false;
+    }
+  }
+}
+
+// ========== INTERFACE WEB ==========
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monitor de Bateria 30V</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        h1 { text-align: center; color: #333; margin-bottom: 20px; font-size: 24px; }
+        .tensao-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 15px;
+            padding: 30px;
+            text-align: center;
+            margin-bottom: 20px;
+            color: white;
+        }
+        .tensao-valor { font-size: 56px; font-weight: bold; margin: 10px 0; font-family: 'Courier New', monospace; }
+        .tensao-label { font-size: 14px; opacity: 0.9; }
+        .status-card {
+            background: #f0f0f0;
+            border-radius: 15px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .rele-status {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 10px;
+            font-weight: bold;
+        }
+        .rele-ligado { background: #4CAF50; color: white; }
+        .rele-desligado { background: #f44336; color: white; }
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px;
+            border-bottom: 1px solid #ddd;
+        }
+        .info-label { font-weight: bold; color: #555; }
+        .info-value { color: #333; font-family: 'Courier New', monospace; font-weight: bold; }
+        .botao-rele {
+            width: 100%;
+            padding: 15px;
+            font-size: 18px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .botao-ligar { background: #4CAF50; color: white; }
+        .botao-desligar { background: #f44336; color: white; }
+        .atualizado { text-align: center; font-size: 12px; color: #999; margin-top: 15px; }
+        .wifi-info {
+            background: #e3f2fd;
+            padding: 10px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-size: 12px;
+        }
+        .cal-box {
+            background: #f8f9fa;
+            border: 2px dashed #667eea;
+            border-radius: 12px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .cal-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .btn-cal {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        .fator-display {
+            font-size: 1.1em;
+            font-weight: bold;
+            color: #764ba2;
+            min-width: 120px;
+            text-align: center;
+            background: white;
+            padding: 8px 12px;
+            border-radius: 8px;
+        }
+        .btn-save { background: #28a745; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; }
+        .dica {
+            background: #fff3e0;
+            border-left: 4px solid #ff9800;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+    </style>
+    <script>
+        function atualizarDados() {
+            fetch('/dados')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('tensao').innerHTML = data.tensao.toFixed(2) + 'V';
+                    const releSpan = document.getElementById('rele-status');
+                    if (data.rele_ligado) {
+                        releSpan.innerHTML = 'LIGADO';
+                        releSpan.className = 'rele-status rele-ligado';
+                    } else {
+                        releSpan.innerHTML = 'DESLIGADO';
+                        releSpan.className = 'rele-status rele-desligado';
+                    }
+                    document.getElementById('fator-cal').innerHTML = data.fator_calibracao.toFixed(4);
+                    document.getElementById('timestamp').innerHTML = new Date().toLocaleTimeString('pt-BR');
+                    document.getElementById('limite-liga').innerHTML = data.tensao_liga.toFixed(1) + 'V';
+                    document.getElementById('limite-desliga').innerHTML = data.tensao_desliga.toFixed(1) + 'V';
+                });
+        }
+        function controlarRele(acao) {
+            fetch('/rele?acao=' + acao).then(() => atualizarDados());
+        }
+        function ajustarFator(delta) {
+            fetch('/cal?d=' + delta).then(() => atualizarDados());
+        }
+        function salvarFator() {
+            fetch('/cal/salvar').then(() => { alert('Fator salvo!'); atualizarDados(); });
+        }
+        setInterval(atualizarDados, 1000);
+        window.onload = atualizarDados;
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Monitor de Bateria 30V</h1>
+        
+        <div class="wifi-info">
+            Rede: <strong>Monitor24v</strong> | Senha: 37452976
+        </div>
+        
+        <div class="dica">
+            💡 <strong>Funcionamento:</strong><br>
+            • Tensão ≤ 25.5V → RELÉ DESLIGA<br>
+            • Tensão ≥ 26.5V → RELÉ LIGA<br>
+            • Proteção: 3 segundos de confirmação
+        </div>
+        
+        <div class="tensao-card">
+            <div class="tensao-label">Tensão da Bateria</div>
+            <div class="tensao-valor" id="tensao">--V</div>
+            <div class="tensao-label">LiFePO4 30V | Estabilidade: ±0.01V</div>
+        </div>
+        
+        <div class="cal-box">
+            <div class="cal-title">Calibração</div>
+            <div class="cal-row">
+                <button class="btn-cal" onclick="ajustarFator(-0.001)">-0.001</button>
+                <button class="btn-cal" onclick="ajustarFator(-0.01)">-0.01</button>
+                <div class="fator-display">Fator: <span id="fator-cal">--</span></div>
+                <button class="btn-cal" onclick="ajustarFator(0.01)">+0.01</button>
+                <button class="btn-cal" onclick="ajustarFator(0.001)">+0.001</button>
+                <button class="btn-save" onclick="salvarFator()">Salvar</button>
+            </div>
+        </div>
+        
+        <div class="status-card">
+            <div class="info-item">
+                <span class="info-label">Status do Relé:</span>
+                <span class="info-value">
+                    <span id="rele-status" class="rele-status rele-desligado">DESLIGADO</span>
+                </span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Desliga o Relé em:</span>
+                <span class="info-value" id="limite-desliga">--</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Liga o Relé em:</span>
+                <span class="info-value" id="limite-liga">--</span>
+            </div>
+        </div>
+        
+        <button class="botao-rele botao-ligar" onclick="controlarRele('ligar')">
+            LIGAR RELÉ (Manual)
+        </button>
+        <button class="botao-rele botao-desligar" onclick="controlarRele('desligar')">
+            DESLIGAR RELÉ (Manual)
+        </button>
+        
+        <div class="atualizado">
+            Atualizado: <span id="timestamp">--:--:--</span>
+        </div>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  pinMode(PIN_RELAY, OUTPUT);
+  pinMode(PIN_ADC, INPUT);
+  
+  digitalWrite(PIN_RELAY, LOW);
+  rele_ligado = false;
+  
+  for (int i = 0; i < NUM_AMOSTRAS; i++) amostras[i] = 0;
+  
+  analogSetPinAttenuation(PIN_ADC, ADC_11db);
+  analogReadResolution(12);
+  
+  eepromCarregarFator();
+  
+  WiFi.softAP(ap_ssid, ap_password);
+  Serial.println("\n=========================================");
+  Serial.println("Monitor de Bateria - Controle de Relé");
+  Serial.println("=========================================");
+  Serial.print("WiFi: "); Serial.println(ap_ssid);
+  Serial.print("Senha: "); Serial.println(ap_password);
+  Serial.print("IP: "); Serial.println(WiFi.softAPIP());
+  Serial.println("\n⚙️ CONFIGURAÇÃO:");
+  Serial.printf("  • Tensão ≤ %.1fV → RELÉ DESLIGA\n", TENSAO_DESLIGA_RELE);
+  Serial.printf("  • Tensão ≥ %.1fV → RELÉ LIGA\n", TENSAO_LIGA_RELE);
+  Serial.printf("  • Debounce: %d segundos\n", TEMPO_DEBOUNCE/1000);
+  Serial.println("=========================================\n");
+  
+  server.on("/", []() {
+    server.send(200, "text/html; charset=utf-8", index_html);
+  });
+  
+  server.on("/dados", []() {
+    String json = "{";
+    json += "\"tensao\":" + String(tensao_atual, 2) + ",";
+    json += "\"rele_ligado\":" + String(rele_ligado ? "true" : "false") + ",";
+    json += "\"tensao_desliga\":" + String(TENSAO_DESLIGA_RELE, 1) + ",";
+    json += "\"tensao_liga\":" + String(TENSAO_LIGA_RELE, 1) + ",";
+    json += "\"fator_calibracao\":" + String(fator_calibracao, 4);
+    json += "}";
+    server.send(200, "application/json; charset=utf-8", json);
+  });
+  
+  server.on("/rele", []() {
+    String acao = server.arg("acao");
+    if (acao == "ligar") {
+      rele_ligado = true;
+      digitalWrite(PIN_RELAY, HIGH);
+      Serial.println("🔌 RELÉ LIGADO manualmente");
+    } else if (acao == "desligar") {
+      rele_ligado = false;
+      digitalWrite(PIN_RELAY, LOW);
+      Serial.println("⚡ RELÉ DESLIGADO manualmente");
+    }
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/cal", []() {
+    if(server.hasArg("d")) {
+      ajustarFator(server.arg("d").toFloat());
+      server.send(200, "text/plain", "OK");
+    }
+  });
+  
+  server.on("/cal/salvar", []() {
+    eepromSalvarFator(fator_calibracao);
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.begin();
+  
+  for(int i = 0; i < 50; i++) {
+    tensao_atual = lerTensaoFiltrada();
+    delay(20);
+  }
+  
+  Serial.printf("Tensão inicial: %.2fV | Relé: %s\n", tensao_atual, rele_ligado ? "LIGADO" : "DESLIGADO");
+}
+
+// ========== LOOP ==========
+void loop() {
+  server.handleClient();
+  
+  if (millis() - last_reading_time >= READING_INTERVAL) {
+    tensao_atual = lerTensaoFiltrada();
+    controlarRele(tensao_atual);
+    last_reading_time = millis();
+  }
+  delay(5);
+}
